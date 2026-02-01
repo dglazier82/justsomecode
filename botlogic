@@ -1,0 +1,1415 @@
+// RainWordsBot.ts
+// -----------------------------------------------------------------------------
+// FULL UPDATED FILE — includes fixes for:
+// 1) "Bot got stuck and stopped playing" (stall timer + intelligent wait logic)
+// 2) "Bot is clicking sequential letters too quickly" (slower reaction delay mapping
+//    + commit window to prevent select/drop thrash)
+// 3) Prevents "select one tile then immediately drop it" loops (commit window + stall rules)
+//
+// NOTES:
+// - This file assumes your existing controller sends actions to the game the same way as before.
+// - The bug you reported (tiles unfrozen visually but not falling, piling up) is typically caused
+//   by select/drop thrash. This commit-window + stall logic stops that behavior at the source.
+//
+// Imports expected in your project:
+import { WildcardDictionary } from './dictionaryTrie';
+import { BotTickSnapshot, BotTileState } from './botSnapshot';
+
+const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+export type BlockReason =
+  | "NONE"
+  | "REMOTE_FROZEN"
+  | "LANDED"
+  | "CONSUMED"
+  | "ROUND_OVER"
+  | "FADING_OUT"
+  | "SELECTED_BY_ME";
+
+export interface BossStats {
+  vocabulary: number;     // knowledge breadth + commonness
+  perception: number;     // sees board areas + readability + memory use
+  reactionTime: number;   // min delay between actions
+  intelligence: number;   // planning, EV, streak/tempo usage, randomness reduction
+  riskAppetite: number;   // hold vs bank, abandon behavior
+}
+
+export type BotAction =
+  | { type: "WAIT" }
+  | { type: "SELECT_TILE"; tileId: number }
+  | { type: "RELEASE_LAST" }
+  | { type: "CLEAR_SELECTION" }
+  | { type: "BANK" };
+
+export interface BotTickLog {
+  frameIndex: number;
+  tickMs: number;
+  timeRemainingSec: number;
+  botScore: number;
+  playerScore: number;
+  botStreak: number;
+  currentPattern: string;
+  selectedTileCount: number;
+  selectedTileIds: number[];
+  planWord: string | null;
+  action: BotAction;
+  actionReason: string;
+  reactionDelayMs: number;
+  nextActionAllowedAtMs: number;
+  canTakeActionNow: boolean;
+  isInCommitWindow: boolean;
+  stallTimeMs: number;
+  candidateTilesCount: number;
+  candidateScores: { tileId: number; ch: string; score: number }[];
+  bankScore: number | null;
+  isValidWord: boolean;
+  isPrefix: boolean;
+  leadsToVocabWord: boolean;
+}
+
+const TEMPO_DECAY_SECONDS = 20;
+const TEMPO_MAX_BONUS = 0.25;
+const STREAK_ACTIVATION_COUNT = 2;
+const STREAK_BONUS = 0.5;
+
+function calculateLengthBonus(wordLength: number): number {
+  if (wordLength < 3) return 0;
+  const diff = wordLength - 3;
+  return 2 * diff + diff * diff;
+}
+
+function calculateTempoMult(secondsSinceFirstLetter: number): number {
+  const clamped = Math.max(0, Math.min(secondsSinceFirstLetter, TEMPO_DECAY_SECONDS));
+  const decay = 1 - clamped / TEMPO_DECAY_SECONDS;
+  return 1 + TEMPO_MAX_BONUS * Math.max(0, decay);
+}
+
+function calculateStreakMult(streak: number): number {
+  return streak >= STREAK_ACTIVATION_COUNT ? 1 + STREAK_BONUS : 1;
+}
+
+function calculateCore(basePoints: number, wordLength: number, wordMult: number, tempoMult: number): number {
+  const rawCore = basePoints + calculateLengthBonus(wordLength);
+  return rawCore * wordMult * tempoMult;
+}
+
+function calculateFinalScore(core: number, streakMult: number): number {
+  return Math.floor(core * streakMult);
+}
+
+function clamp(n: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, n));
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
+}
+
+function stat01(v: number): number {
+  return clamp(v / 100, 0, 1);
+}
+
+export const DRIPPY_TIM_STATS: BossStats = {
+  vocabulary: 40,
+  perception: 40,
+  reactionTime: 45,
+  intelligence: 40,
+  riskAppetite: 40,
+};
+
+type TileMemory = {
+  ch: string;
+  lastSeenMs: number;
+  // we only “trust” memory if it was seen while readable
+  lastSeenLegible: boolean;
+};
+
+type PlannedTarget = {
+  word: string;        // target word we intend to build (not locked-in)
+  createdAtMs: number;
+};
+
+export class RainWordsBot {
+  private nextActionAllowedAtMs = 0;
+  private actionTimestampsMs: number[] = [];
+  private rngState: number;
+
+  private botSelectedTileIds: number[] = [];
+  private botScore: number = 0;
+  private botStreak: number = 0;
+  private firstLetterSelectedAtMs: number = 0;
+  private bankedWords: string[] = [];
+
+  // Boss-limited vocabulary set (your top 20k common words, intersected with game dictionary)
+  private vocabulary: Set<string> | null;
+
+  // Precomputed for planning if vocabulary is provided
+  private vocabWords: string[] = [];
+  private vocabWordsByLen: Map<number, string[]> = new Map();
+  private startLetterRank: string[] = [];
+  private prefixStats: Map<string, { count: number; totalLen: number; maxLen: number }> = new Map();
+
+  // Board vision memory
+  private tileMemory: Map<number, TileMemory> = new Map();
+
+  // Soft “plan” (not a lock)
+  private plan: PlannedTarget | null = null;
+
+  // Prevent "tap then immediately drop" loops
+  private commitStartedAtMs = 0;
+
+  // Last known pattern for external queries
+  private lastKnownPattern: string = '';
+
+  // Stall detection (prevents getting stuck forever)
+  private stallSinceMs = 0;
+  private stallPattern = "";
+
+  constructor(
+    private readonly stats: BossStats,
+    private readonly dict: WildcardDictionary,
+    seed = 1337,
+    vocabulary: Set<string> | null = null
+  ) {
+    this.rngState = seed >>> 0;
+    this.vocabulary = vocabulary;
+
+    if (this.vocabulary) {
+      this.vocabWords = Array.from(this.vocabulary)
+        .map(w => (typeof w === "string" ? w.trim().toUpperCase() : ""))
+        .filter(w => w.length >= 3 && /^[A-Z]+$/.test(w)); // ONLY clean A–Z words
+
+      this.vocabWordsByLen = new Map<number, string[]>();
+      for (const w of this.vocabWords) {
+        const L = w.length;
+        const arr = this.vocabWordsByLen.get(L) ?? [];
+        arr.push(w);
+        this.vocabWordsByLen.set(L, arr);
+      }
+
+      this.buildStartLetterRank();
+      this.buildPrefixStats();
+    }
+  }
+
+  /* ============================================================================
+   * Vocabulary / wildcard helpers
+   * ========================================================================== */
+
+  private isInVocabulary(pattern: string): boolean {
+    if (!this.vocabulary) return true;
+    const upper = pattern.toUpperCase();
+
+    // Wildcard: check if ANY replacement exists in vocabulary
+    if (!upper.includes('★')) {
+      return this.vocabulary.has(upper);
+    }
+    // Multiple ★ possible; expand recursively but with early exit
+    return this.vocabPatternExists(upper);
+  }
+
+  private vocabPatternExists(pattern: string): boolean {
+    const idx = pattern.indexOf('★');
+    if (idx < 0) return this.vocabulary!.has(pattern);
+
+    for (const letter of ALPHABET) {
+      const test = pattern.substring(0, idx) + letter + pattern.substring(idx + 1);
+      if (this.vocabPatternExists(test)) return true;
+    }
+    return false;
+  }
+
+  private canLeadToVocabWord(pattern: string): boolean {
+    // If no boss vocabulary provided, fall back to dictionary trie prefix check
+    if (!this.vocabulary) return this.dict.isPrefixPattern(pattern);
+
+    const upper = pattern.toUpperCase();
+
+    // Wildcard prefix check: expand but with pruning
+    if (upper.includes('★')) {
+      return this.vocabPrefixExists(upper);
+    }
+
+    // Fast prefix stats check: if we precomputed prefixStats, this is O(1)
+    const s = this.prefixStats.get(upper);
+    if (s && s.count > 0) return true;
+
+    // Fallback scan (should be rare if prefixStats is built)
+    for (const word of this.vocabulary) {
+      if (word.startsWith(upper)) return true;
+    }
+    return false;
+  }
+
+  private vocabPrefixExists(pattern: string): boolean {
+    const idx = pattern.indexOf('★');
+    if (idx < 0) return (this.prefixStats.get(pattern)?.count ?? 0) > 0;
+
+    for (const letter of ALPHABET) {
+      const test = pattern.substring(0, idx) + letter + pattern.substring(idx + 1);
+      if (this.vocabPrefixExists(test)) return true;
+    }
+    return false;
+  }
+
+  private isValidWord(pattern: string): boolean {
+    return this.isInVocabulary(pattern) && this.dict.isValidPattern(pattern);
+  }
+
+  /* ============================================================================
+   * Getters
+   * ========================================================================== */
+
+  getSelectedTileIds(): number[] {
+    return [...this.botSelectedTileIds];
+  }
+
+  rollbackLastSelection(): void {
+    if (this.botSelectedTileIds.length > 0) {
+      this.botSelectedTileIds.pop();
+    }
+  }
+
+  getScore(): number {
+    return this.botScore;
+  }
+
+  getStreak(): number {
+    return this.botStreak;
+  }
+
+  getBankedWords(): string[] {
+    return [...this.bankedWords];
+  }
+
+  getFirstLetterSelectedAtMs(): number | null {
+    return this.firstLetterSelectedAtMs > 0 ? this.firstLetterSelectedAtMs : null;
+  }
+
+  canBankCurrentWord(): boolean {
+    // Check if current selection forms a valid word that can be banked
+    if (this.botSelectedTileIds.length < 3) return false;
+    if (!this.lastKnownPattern) return false;
+    return this.isValidWord(this.lastKnownPattern);
+  }
+
+  getCurrentPattern(tiles: BotTileState[]): string {
+    const tilesById = new Map(tiles.map(t => [t.id, t]));
+    return this.botSelectedTileIds.map(id => tilesById.get(id)?.ch || '').join('');
+  }
+
+  /* ============================================================================
+   * RNG
+   * ========================================================================== */
+
+  private rand(): number {
+    let x = this.rngState;
+    x ^= x << 13;
+    x ^= x >>> 17;
+    x ^= x << 5;
+    this.rngState = x >>> 0;
+    return (this.rngState & 0xffffffff) / 0x100000000;
+  }
+
+  /* ============================================================================
+   * Stat mappings
+   * ========================================================================== */
+
+  private reactionDelayMs(): number {
+    // SLOWED DOWN: low-skill bots should not click too fast.
+    // 0 => 1200ms, 100 => 260ms
+    const r = stat01(this.stats.reactionTime);
+    return Math.round(lerp(1200, 260, r));
+  }
+
+  private intelligenceNoise(): number {
+    const iq = stat01(this.stats.intelligence);
+    return lerp(0.35, 0.03, iq);
+  }
+
+  private maxActionsPerSecond(): number {
+    const iq = stat01(this.stats.intelligence);
+    return lerp(2.0, 7.0, iq);
+  }
+
+  private canTakeAction(nowMs: number): boolean {
+    const windowMs = 1000;
+    this.actionTimestampsMs = this.actionTimestampsMs.filter(t => nowMs - t < windowMs);
+    return this.actionTimestampsMs.length < this.maxActionsPerSecond();
+  }
+
+  private recordAction(nowMs: number): void {
+    this.actionTimestampsMs.push(nowMs);
+  }
+
+  private riskBias(): number {
+    const r = stat01(this.stats.riskAppetite);
+    return lerp(-0.25, 0.25, r);
+  }
+
+  private maxWordLength(): number {
+    // Low vocab => shorter words, high vocab => longer
+    const v = stat01(this.stats.vocabulary);
+    const iq = stat01(this.stats.intelligence);
+    // Allow smarter bosses to pursue longer words.
+    return Math.round(lerp(3, 7, 0.6 * v + 0.4 * iq));
+  }
+
+  /* ============================================================================
+   * Commit window + stall timers
+   * ========================================================================== */
+
+  private commitWindowMs(): number {
+    // Minimum time after starting a word before undo/clear is allowed (unless truly dead).
+    // Low skill = longer commitment, high skill = shorter.
+    const rt = stat01(this.stats.reactionTime);
+    const iq = stat01(this.stats.intelligence);
+    return Math.round(lerp(900, 220, 0.55 * rt + 0.45 * iq));
+  }
+
+  private stallTimeoutMs(): number {
+    // How long the bot may hold an unchanging pattern before forcing a decision.
+    // Smart/risky bots can hold longer (waiting for a key letter).
+    const iq = stat01(this.stats.intelligence);
+    const risk = stat01(this.stats.riskAppetite);
+    return Math.round(lerp(900, 2600, 0.7 * iq + 0.3 * risk));
+  }
+
+  private updateStallTracking(nowMs: number, pattern: string): void {
+    if (pattern !== this.stallPattern) {
+      this.stallPattern = pattern;
+      this.stallSinceMs = nowMs;
+    } else if (this.stallSinceMs === 0) {
+      this.stallSinceMs = nowMs;
+    }
+  }
+
+  private isInCommitWindow(nowMs: number): boolean {
+    if (this.botSelectedTileIds.length === 0) return false;
+    if (this.commitStartedAtMs === 0) return false;
+    return (nowMs - this.commitStartedAtMs) < this.commitWindowMs();
+  }
+
+  /* ============================================================================
+   * PERCEPTION: readability zones + memory
+   * ========================================================================== */
+
+  private topUnreadablePx(): number {
+    const p = stat01(this.stats.perception);
+    return Math.round(lerp(110, 55, p));
+  }
+
+  private bottomDangerBandPx(): number {
+    const p = stat01(this.stats.perception);
+    return Math.round(lerp(120, 70, p));
+  }
+
+  private memoryTTLms(): number {
+    const p = stat01(this.stats.perception);
+    return Math.round(lerp(900, 2800, p));
+  }
+
+  // ★ BOT FAIRNESS FIX
+  // True if the tile is FULLY visible in the human-visible board area:
+  // Bot can only select tiles that are FULLY inside the visible game board:
+  // - Top: tile must be fully entered (tileTop >= boardTop)
+  // - Bottom: tile must NOT touch the bottom edge (tileBottom < boardBottom)
+  // As soon as any part of the tile touches the bottom boundary, it's no longer selectable
+  private tileOverlapsHumanBoard(tile: BotTileState, s: BotTickSnapshot): boolean {
+    const boardTop = s.boardRectTopPx;
+    const boardBottom = s.boardRectTopPx + s.boardRectHeightPx;
+
+    const tileTop = tile.tileTop;
+    const tileBottom = tile.tileTop + tile.tileHeight;
+
+    const isInside = tileTop >= boardTop && tileBottom < boardBottom;
+    
+    // Debug logging for tile selection
+    if (!isInside && tile.isClickable && tile.blockReason === 'NONE') {
+      //console.log(`[BOT REJECT] tile ${tile.id} '${tile.ch}': tileTop=${tileTop.toFixed(1)} tileBottom=${tileBottom.toFixed(1)} boardBottom=${boardBottom.toFixed(1)} - OUTSIDE BOARD`);
+    }
+
+    // Tile must be fully inside - strict check at bottom (< not <=)
+    // As soon as tile touches bottom, it's not selectable
+    return isInside;
+  }
+
+  private updateTileMemory(s: BotTickSnapshot): void {
+    const now = s.nowMs;
+
+    for (const t of s.tiles) {
+      const readableZone = t.tileTop >= this.topUnreadablePx();
+      const visiblePctOk = t.isLegible && t.glyphVisiblePct >= lerp(0.92, 0.72, stat01(this.stats.perception));
+
+      if (
+        t.isClickable &&
+        t.blockReason === 'NONE' &&
+        readableZone &&
+        visiblePctOk &&
+        this.tileOverlapsHumanBoard(t, s) // ★ FIX
+      ) {
+        this.tileMemory.set(t.id, { ch: t.ch, lastSeenMs: now, lastSeenLegible: true });
+      }
+    }
+
+    const ttl = this.memoryTTLms();
+    for (const [id, mem] of this.tileMemory.entries()) {
+      if (now - mem.lastSeenMs > ttl) this.tileMemory.delete(id);
+    }
+  }
+
+  private tileIsReadableNow(tile: BotTileState, floorY: number): boolean {
+    if (tile.tileTop < this.topUnreadablePx()) return false;
+    if (tile.tileTop >= floorY) return false;
+
+    const tileBottom = tile.tileTop + tile.tileHeight;
+    const visibleBottom = Math.min(floorY, tileBottom);
+    const visibleHeight = visibleBottom - tile.tileTop;
+    const visiblePct = tile.tileHeight > 0 ? visibleHeight / tile.tileHeight : 0;
+
+    const p = stat01(this.stats.perception);
+    const minTileVisible = lerp(0.85, 0.68, p);
+    if (visiblePct < minTileVisible) return false;
+
+    const minGlyph = lerp(0.94, 0.72, p);
+    if (!tile.isLegible || tile.glyphVisiblePct < minGlyph) return false;
+
+    const missChance = lerp(0.45, 0.05, p);
+    return this.rand() > missChance;
+  }
+
+  private tileIsClickableViaMemory(tile: BotTileState, floorY: number): boolean {
+    const mem = this.tileMemory.get(tile.id);
+    if (!mem || !mem.lastSeenLegible) return false;
+
+    const bottomBand = this.bottomDangerBandPx();
+    const tileBottom = tile.tileTop + tile.tileHeight;
+    const distToFloor = floorY - tileBottom;
+
+    return distToFloor >= -12 && distToFloor <= bottomBand;
+  }
+
+  private tileIsConsidered(tile: BotTileState, floorY: number, s: BotTickSnapshot): boolean {
+    if (!tile.isClickable) return false;
+    if (tile.blockReason !== 'NONE') return false;
+
+    // ★ FIX: must be visible to the human RIGHT NOW
+    if (!this.tileOverlapsHumanBoard(tile, s)) return false;
+
+    if (this.tileIsReadableNow(tile, floorY)) return true;
+    if (this.tileIsClickableViaMemory(tile, floorY)) return true;
+
+    return false;
+  }
+
+  /* ============================================================================
+   * Planning: full-word recognition + distinctive prefix recognition
+   * ========================================================================== */
+
+  private buildStartLetterRank(): void {
+    const counts: Record<string, number> = {};
+    for (const w of this.vocabWords) {
+      const c = w[0];
+      counts[c] = (counts[c] ?? 0) + 1;
+    }
+    this.startLetterRank = Object.entries(counts)
+      .sort((a, b) => b[1] - a[1])
+      .map(([c]) => c);
+  }
+
+  private buildPrefixStats(): void {
+    const stats = new Map<string, { count: number; totalLen: number; maxLen: number }>();
+
+    for (const w of this.vocabWords) {
+      for (let i = 1; i <= Math.min(w.length, 10); i++) {
+        const p = w.slice(0, i);
+        const s = stats.get(p) ?? { count: 0, totalLen: 0, maxLen: 0 };
+        s.count += 1;
+        s.totalLen += w.length;
+        s.maxLen = Math.max(s.maxLen, w.length);
+        stats.set(p, s);
+      }
+    }
+
+    this.prefixStats = stats;
+  }
+
+  private prefixConfidence(pattern: string): number {
+    if (!this.vocabulary) return 0.2;
+
+    const upper = pattern.toUpperCase();
+
+    if (upper.includes('★')) {
+      const idx = upper.indexOf('★');
+      let samples = 0;
+      let sum = 0;
+      const iq = stat01(this.stats.intelligence);
+      const sampleN = Math.round(lerp(4, 10, iq));
+
+      for (let k = 0; k < 26 && samples < sampleN; k++) {
+        const letter = ALPHABET[(k * 7) % 26];
+        const test = upper.substring(0, idx) + letter + upper.substring(idx + 1);
+        sum += this.prefixConfidence(test);
+        samples++;
+      }
+      return samples ? sum / samples : 0.05;
+    }
+
+    const s = this.prefixStats.get(upper);
+    if (!s || s.count <= 0) return 0;
+
+    const avgLen = s.totalLen / s.count;
+    const rarity = 1 - clamp(Math.log10(s.count + 1) / Math.log10(60), 0, 1);
+    const lenSig = clamp((avgLen - 4) / 6, 0, 1);
+
+    const iq = stat01(this.stats.intelligence);
+    const raw = lerp(0.40, 0.65, iq) * rarity + (1 - lerp(0.40, 0.65, iq)) * lenSig;
+
+    const noise = this.intelligenceNoise();
+    return clamp(raw * (1 + (this.rand() * 2 - 1) * noise), 0, 1);
+  }
+
+  private collectAvailableLetterCounts(s: BotTickSnapshot, blockedByPlayer: Set<number>): Record<string, number> {
+    const counts: Record<string, number> = {};
+    for (const t of s.tiles) {
+      if (blockedByPlayer.has(t.id)) continue;
+      if (this.botSelectedTileIds.includes(t.id)) continue;
+      if (!this.tileIsConsidered(t, s.floorY, s)) continue;
+
+      counts[t.ch] = (counts[t.ch] ?? 0) + 1;
+    }
+    return counts;
+  }
+
+  private canFormWordFromCounts(
+    word: string,
+    counts: Record<string, number>
+  ): { ok: boolean; blanksNeeded: number } {
+    if (typeof word !== "string" || word.length === 0) {
+      return { ok: false, blanksNeeded: 999 };
+    }
+    if (!counts || typeof counts !== "object") {
+      return { ok: false, blanksNeeded: 999 };
+    }
+
+    const needed: Record<string, number> = {};
+    for (const c of word) needed[c] = (needed[c] ?? 0) + 1;
+
+    let blanks = counts["★"] ?? 0;
+    let blanksNeeded = 0;
+
+    for (const [ch, n] of Object.entries(needed)) {
+      const have = counts[ch] ?? 0;
+      if (have >= n) continue;
+
+      const missing = n - have;
+      if (blanks >= missing) {
+        blanks -= missing;
+        blanksNeeded += missing;
+      } else {
+        return { ok: false, blanksNeeded: 999 };
+      }
+    }
+
+    return { ok: true, blanksNeeded };
+  }
+
+  private planFromBoardAtStart(s: BotTickSnapshot, blockedByPlayer: Set<number>): void {
+    if (this.botSelectedTileIds.length !== 0) return;
+    if (!this.vocabulary || this.vocabWords.length === 0) return;
+
+    const iq = stat01(this.stats.intelligence);
+    const p = stat01(this.stats.perception);
+    const v = stat01(this.stats.vocabulary);
+
+    const planChance = lerp(0.25, 0.95, 0.6 * p + 0.4 * iq);
+    if (this.rand() > planChance) return;
+
+    const counts = this.collectAvailableLetterCounts(s, blockedByPlayer);
+
+    const maxLen = this.maxWordLength();
+    const minLen = 3;
+
+    const testBudget = Math.round(lerp(30, 250, 0.5 * iq + 0.5 * p));
+
+    const lenWeights: number[] = [];
+    for (let L = minLen; L <= maxLen; L++) {
+      const shortBias = (1 - v) * (maxLen - L + 1);
+      const longBias = iq * (L - minLen + 1);
+      lenWeights.push(1 + shortBias + longBias);
+    }
+
+    const totalW = lenWeights.reduce((a, b) => a + b, 0);
+
+    const sampled: string[] = [];
+    for (let tries = 0; tries < testBudget; tries++) {
+      const r = this.rand() * totalW;
+      let acc = 0;
+      let chosenLen = minLen;
+      for (let i = 0; i < lenWeights.length; i++) {
+        acc += lenWeights[i];
+        if (r <= acc) { chosenLen = minLen + i; break; }
+      }
+
+      const arr = this.vocabWordsByLen.get(chosenLen);
+      if (!arr || arr.length === 0) continue;
+
+      const w = arr[Math.floor(this.rand() * arr.length)];
+      if (typeof w === "string" && w.length > 0) sampled.push(w);
+    }
+
+    let best: { word: string; score: number } | null = null;
+
+    for (const w of sampled) {
+      const form = this.canFormWordFromCounts(w, counts);
+      if (!form.ok) continue;
+
+      const lengthVal = calculateLengthBonus(w.length);
+      const blankPenalty = form.blanksNeeded * lerp(14, 4, iq);
+
+      const hasAnyMultTile = s.tiles.some(t => t.isWordMultTile && this.tileIsConsidered(t, s.floorY, s));
+      const multSignal = hasAnyMultTile ? lerp(0, 10, iq) : 0;
+
+      const simplicityBonus = (v < 0.45 && w.length <= 4) ? 6 : 0;
+
+      const noise = this.intelligenceNoise();
+      let score = (lengthVal + simplicityBonus + multSignal) - blankPenalty;
+      score *= 1 + (this.rand() * 2 - 1) * noise;
+
+      if (!best || score > best.score) best = { word: w, score };
+    }
+
+    if (best) {
+      this.plan = { word: best.word, createdAtMs: s.nowMs };
+    }
+  }
+
+  private getNextNeededCharFromPlan(currentPattern: string): string | null {
+    if (!this.plan) return null;
+
+    const target = this.plan.word;
+    const idx = currentPattern.length;
+
+    if (idx >= target.length) return null;
+
+    for (let i = 0; i < currentPattern.length; i++) {
+      const p = currentPattern[i];
+      const t = target[i];
+      if (p === '★') continue;
+      if (p !== t) return null;
+    }
+
+    return target[idx];
+  }
+
+  private pickTileForNeededChar(
+    s: BotTickSnapshot,
+    blockedByPlayer: Set<number>,
+    neededChar: string
+  ): number | null {
+    const iq = stat01(this.stats.intelligence);
+
+    let best: { id: number; score: number } | null = null;
+
+    for (const t of s.tiles) {
+      if (blockedByPlayer.has(t.id)) continue;
+      if (this.botSelectedTileIds.includes(t.id)) continue;
+      if (!this.tileIsConsidered(t, s.floorY, s)) continue;
+      if (t.blockReason !== 'NONE' || !t.isClickable) continue;
+
+      const usable = (t.ch === neededChar) || (t.ch === '★');
+      if (!usable) continue;
+
+      const urgency = 1 - clamp(t.timeToBottomSec / 5, 0, 1);
+      const multBonus = t.isWordMultTile ? lerp(0.2, 1.0, iq) : 0;
+      const starPenalty = t.ch === '★' ? lerp(0.18, 0.04, iq) : 0;
+      const pointsBonus = clamp(t.tilePointsShown / 10, 0, 1) * lerp(0.1, 0.35, iq);
+
+      const score = urgency + multBonus + pointsBonus - starPenalty;
+      if (!best || score > best.score) best = { id: t.id, score };
+    }
+
+    return best ? best.id : null;
+  }
+
+  /* ============================================================================
+   * Scoring evaluation
+   * ========================================================================== */
+
+  private getWordMultProduct(tiles: BotTileState[]): number {
+    const tilesById = new Map(tiles.map(t => [t.id, t]));
+    let product = 1;
+    for (const id of this.botSelectedTileIds) {
+      const tile = tilesById.get(id);
+      if (tile) product *= tile.wordMultValue;
+    }
+    return product;
+  }
+
+  private getBasePoints(tiles: BotTileState[]): number {
+    const tilesById = new Map(tiles.map(t => [t.id, t]));
+    let points = 0;
+    for (const id of this.botSelectedTileIds) {
+      const tile = tilesById.get(id);
+      if (tile && tile.ch !== '★') points += tile.tilePointsShown;
+    }
+    return points;
+  }
+
+  private getTempoSeconds(nowMs: number): number {
+    if (this.firstLetterSelectedAtMs === 0) return 0;
+    return (nowMs - this.firstLetterSelectedAtMs) / 1000;
+  }
+
+  private estimateBotBankScore(s: BotTickSnapshot): number {
+    const base = this.getBasePoints(s.tiles);
+    const len = this.botSelectedTileIds.length;
+    const wordMult = this.getWordMultProduct(s.tiles);
+    const tempoMult = calculateTempoMult(this.getTempoSeconds(s.nowMs));
+    const streakMult = calculateStreakMult(this.botStreak);
+    const core = calculateCore(base, len, wordMult, tempoMult);
+    return calculateFinalScore(core, streakMult);
+  }
+
+  private shouldBankNow(s: BotTickSnapshot, playerScore: number): boolean {
+    if (this.botSelectedTileIds.length < 3) return false;
+    const pattern = this.getCurrentPattern(s.tiles);
+    if (!this.isValidWord(pattern)) return false;
+
+    const iq = stat01(this.stats.intelligence);
+    const risk = stat01(this.stats.riskAppetite);
+
+    const bankScore = this.estimateBotBankScore(s);
+    const scoreDiff = this.botScore - playerScore;
+    const timeLeft01 = clamp(s.timeRemainingMs / s.matchDurationMs, 0, 1);
+
+    let threshold = 12;
+    threshold -= Math.round(lerp(3, 0, iq));
+    threshold -= Math.round(lerp(0, 8, 1 - timeLeft01));
+
+    if (scoreDiff < 0) threshold -= Math.round(clamp(Math.abs(scoreDiff) / 30, 0, 6));
+    if (scoreDiff > 0) threshold += Math.round(clamp(scoreDiff / 40, 0, 5));
+
+    threshold = Math.round(threshold * (1 + lerp(-0.15, 0.25, risk)));
+
+    const err = lerp(6, 1, iq);
+    threshold += Math.round((this.rand() * 2 - 1) * err);
+
+    return bankScore >= threshold;
+  }
+
+  /* ============================================================================
+   * Undo / clear / abandon logic (updated: commit window + stall timeout)
+   * ========================================================================== */
+
+  private isSelectionSafeToHold(tiles: BotTileState[]): boolean {
+    const tilesById = new Map(tiles.map(t => [t.id, t]));
+    for (const id of this.botSelectedTileIds) {
+      const t = tilesById.get(id);
+      if (!t) return false;
+      if (t.timeToBottomSec < 0.6) return false;
+    }
+    return true;
+  }
+
+  private bestImmediateTileOpportunity(s: BotTickSnapshot, blockedByPlayer: Set<number>): number {
+    const iq = stat01(this.stats.intelligence);
+    const risk = stat01(this.stats.riskAppetite);
+    const v = stat01(this.stats.vocabulary);
+
+    let best = 0;
+    for (const t of s.tiles) {
+      if (!t.isClickable) continue;
+      if (t.blockReason !== 'NONE') continue;
+      if (blockedByPlayer.has(t.id)) continue;
+      if (this.botSelectedTileIds.includes(t.id)) continue;
+      if (!this.tileIsConsidered(t, s.floorY, s)) continue;
+
+      const urgency = 1 - clamp(t.timeToBottomSec / 5, 0, 1);
+      const multBonus = t.isWordMultTile ? lerp(0.25, 1.0, iq) : 0;
+      const starBonus = t.ch === '★' ? lerp(0.2, 0.9, (v + risk) / 2) : 0;
+      const pointsBonus = clamp(t.tilePointsShown / 10, 0, 1) * lerp(0.15, 0.35, iq);
+
+      const score = urgency + 0.6 * multBonus + 0.4 * starBonus + 0.25 * pointsBonus;
+      if (score > best) best = score;
+    }
+    return best;
+  }
+
+  private decideUndoClearOrAbandon(s: BotTickSnapshot, playerScore: number, blockedByPlayer: Set<number>): BotAction | null {
+    if (this.botSelectedTileIds.length === 0) return null;
+
+    const pattern = this.getCurrentPattern(s.tiles);
+
+    // Stall tracking for current held pattern
+    this.updateStallTracking(s.nowMs, pattern);
+
+    // Commit window prevents thrash (tap then instantly drop)
+    const inCommit = this.isInCommitWindow(s.nowMs);
+
+    // First: must be able to lead to a vocab word (stops gibberish loops)
+    const leadsToVocab = this.canLeadToVocabWord(pattern);
+    if (!leadsToVocab) {
+      // During commit window, don't thrash. Wait briefly for new tiles.
+      if (inCommit) return null;
+
+      // If we've waited too long on a dead path, unwind.
+      const stalledTooLong = (this.stallSinceMs > 0) && ((s.nowMs - this.stallSinceMs) > this.stallTimeoutMs());
+      if (!stalledTooLong) return null;
+
+      if (this.botSelectedTileIds.length <= 3) return { type: "RELEASE_LAST" };
+      return { type: "CLEAR_SELECTION" };
+    }
+
+    const isPrefix = this.dict.isPrefixPattern(pattern);
+    const canBank = this.botSelectedTileIds.length >= 3 && this.isValidWord(pattern);
+    const safeToHold = this.isSelectionSafeToHold(s.tiles);
+
+    const iq = stat01(this.stats.intelligence);
+    const risk = stat01(this.stats.riskAppetite);
+
+    // If prefix dead (dictionary-wise), undo/clear.
+    // BUT: during commit window, only unwind if it is clearly dead.
+    if (!isPrefix) {
+      this.plan = null;
+      if (inCommit) return null;
+
+      const preferUndo = lerp(0.45, 0.9, iq);
+      if (this.botSelectedTileIds.length <= 4 && this.rand() < preferUndo) return { type: "RELEASE_LAST" };
+      return { type: "CLEAR_SELECTION" };
+    }
+
+    // If valid but unsafe to hold, bank defensively
+    if (canBank && !safeToHold) {
+      this.plan = null;
+      return { type: "BANK" };
+    }
+
+    // Intelligent waiting vs "stuck forever":
+    // If pattern isn't changing for too long, force action.
+    const stalledTooLong = (this.stallSinceMs > 0) && ((s.nowMs - this.stallSinceMs) > this.stallTimeoutMs());
+    if (stalledTooLong) {
+      if (canBank) {
+        this.plan = null;
+        return { type: "BANK" };
+      }
+      this.plan = null;
+      return { type: "CLEAR_SELECTION" };
+    }
+
+    // Abandon only if risky and sees much better opportunity
+    const willingToAbandon = risk > 0.60;
+    if (willingToAbandon && !inCommit) {
+      const currentBankValue = canBank ? this.estimateBotBankScore(s) : 0;
+      const bestOpp = this.bestImmediateTileOpportunity(s, blockedByPlayer);
+
+      const oppThreshold = lerp(1.35, 0.85, iq);
+      const valueThreshold = Math.round(lerp(18, 10, iq));
+
+      if (bestOpp >= oppThreshold && currentBankValue < valueThreshold) {
+        this.plan = null;
+        return { type: "CLEAR_SELECTION" };
+      }
+    }
+
+    return null;
+  }
+
+  /* ============================================================================
+   * Core decision
+   * ========================================================================== */
+
+  private chooseNextAction(s: BotTickSnapshot, playerScore: number, blockedByPlayer: Set<number>): BotAction {
+    if (!s.snapshotIntegrityOk || s.selectionMissingTileIds.length > 0) return { type: "WAIT" };
+    if (s.roundOver || s.bankInFlight) return { type: "WAIT" };
+
+    // Vision memory updated every tick
+    this.updateTileMemory(s);
+
+    const fix = this.decideUndoClearOrAbandon(s, playerScore, blockedByPlayer);
+    if (fix) return fix;
+
+    const pattern = this.getCurrentPattern(s.tiles);
+    this.lastKnownPattern = pattern; // Update for external queries
+
+    // Bank decision
+    if (this.shouldBankNow(s, playerScore)) {
+      this.plan = null;
+      return { type: "BANK" };
+    }
+
+    // Too long for this boss
+    const maxLen = this.maxWordLength();
+    if (this.botSelectedTileIds.length >= maxLen) {
+      if (this.botSelectedTileIds.length >= 3 && this.isValidWord(pattern)) return { type: "BANK" };
+      this.plan = null;
+      return { type: "CLEAR_SELECTION" };
+    }
+
+    // Plan from the board only when starting a word
+    if (this.botSelectedTileIds.length === 0) {
+      this.planFromBoardAtStart(s, blockedByPlayer);
+    }
+
+    // Follow plan if still fresh
+    if (this.plan) {
+      if (s.nowMs - this.plan.createdAtMs > 1600) {
+        this.plan = null;
+      } else {
+        const needed = this.getNextNeededCharFromPlan(pattern);
+        if (needed) {
+          const tileId = this.pickTileForNeededChar(s, blockedByPlayer, needed);
+          if (tileId != null) {
+            const ch = s.tiles.find(t => t.id === tileId)?.ch ?? '';
+            const newPattern = pattern + ch;
+            if (this.canLeadToVocabWord(newPattern)) return { type: "SELECT_TILE", tileId };
+            this.plan = null;
+          }
+        }
+      }
+    }
+
+    // Prefix recognition scoring
+    const nextLetters = this.dict.suggestNextLetters(pattern, 26);
+    const nextSet = new Set(nextLetters);
+
+    const candidates = s.tiles.filter(t =>
+      t.isClickable &&
+      t.blockReason === 'NONE' &&
+      !blockedByPlayer.has(t.id) &&
+      !this.botSelectedTileIds.includes(t.id) &&
+      this.tileIsConsidered(t, s.floorY, s)
+    );
+
+    if (candidates.length === 0) {
+      if (this.botSelectedTileIds.length > 0) {
+        const iq = stat01(this.stats.intelligence);
+        if (!this.isInCommitWindow(s.nowMs) && this.rand() < lerp(0.10, 0.02, iq)) {
+          this.plan = null;
+          return { type: "CLEAR_SELECTION" };
+        }
+      }
+      return { type: "WAIT" };
+    }
+
+    const iq = stat01(this.stats.intelligence);
+    const v = stat01(this.stats.vocabulary);
+    const risk = stat01(this.stats.riskAppetite);
+
+    let best: { tileId: number; score: number } | null = null;
+
+    for (const tile of candidates) {
+      const matchesDictPrefix = tile.ch === '★' ? true : (nextSet.size === 0 ? true : nextSet.has(tile.ch));
+      if (!matchesDictPrefix) continue;
+
+      const newPattern = pattern + tile.ch;
+      if (!this.canLeadToVocabWord(newPattern)) continue;
+
+      const urgency = 1 - clamp(tile.timeToBottomSec / 5, 0, 1);
+      const multBonus = tile.isWordMultTile ? lerp(0.2, 1.0, iq) : 0;
+      const pointsBonus = clamp(tile.tilePointsShown / 8, 0, 1) * lerp(0.12, 0.35, iq);
+
+      const starBase = (tile.ch === '★') ? (0.18 + 0.62 * (0.5 * v + 0.5 * risk)) : 0;
+
+      const conf = this.prefixConfidence(newPattern);
+      const confWeight = lerp(0.05, 0.95, iq);
+
+      let score =
+        1.0 * urgency +
+        0.6 * multBonus +
+        0.35 * pointsBonus +
+        starBase +
+        confWeight * conf;
+
+      score *= 1 + (risk - 0.5) * 0.20;
+      score *= 1 + (this.rand() * 2 - 1) * this.intelligenceNoise();
+
+      if (!best || score > best.score) best = { tileId: tile.id, score };
+    }
+
+    if (best) return { type: "SELECT_TILE", tileId: best.tileId };
+
+    if (this.botSelectedTileIds.length >= 3 && this.isValidWord(pattern)) {
+      const safeBias = 1 - stat01(this.stats.riskAppetite);
+      if (this.rand() < lerp(0.35, 0.90, safeBias)) {
+        this.plan = null;
+        return { type: "BANK" };
+      }
+    }
+
+    return { type: "WAIT" };
+  }
+
+  /* ============================================================================
+   * Public tick + state execution
+   * ========================================================================== */
+
+  tick(s: BotTickSnapshot, playerScore: number, playerSelectedTileIds: number[]): BotAction | null {
+    if (s.roundOver) return null;
+
+    if (s.nowMs < this.nextActionAllowedAtMs) return null;
+    if (!this.canTakeAction(s.nowMs)) return null;
+
+    const blockedByPlayer = new Set(playerSelectedTileIds);
+
+    this.cleanupMissingTiles(s.tiles);
+
+    const action = this.chooseNextAction(s, playerScore, blockedByPlayer);
+    if (action.type === "WAIT") return null;
+
+    this.recordAction(s.nowMs);
+    this.nextActionAllowedAtMs = s.nowMs + this.reactionDelayMs();
+
+    this.executeAction(action, s);
+
+    return action;
+  }
+
+  private cleanupMissingTiles(tiles: BotTileState[]): void {
+    const tileIds = new Set(tiles.map(t => t.id));
+
+    this.botSelectedTileIds = this.botSelectedTileIds.filter(id => tileIds.has(id));
+    if (this.botSelectedTileIds.length === 0) {
+      this.firstLetterSelectedAtMs = 0;
+      this.commitStartedAtMs = 0;
+      this.stallSinceMs = 0;
+      this.stallPattern = "";
+    }
+
+    for (const id of this.tileMemory.keys()) {
+      if (!tileIds.has(id)) this.tileMemory.delete(id);
+    }
+  }
+
+  private executeAction(action: BotAction, s: BotTickSnapshot): void {
+    switch (action.type) {
+      case "SELECT_TILE":
+        // Debug: log the tile position when selected
+        const selectedTile = s.tiles.find(t => t.id === action.tileId);
+        if (selectedTile) {
+          const boardBottom = s.boardRectTopPx + s.boardRectHeightPx;
+          console.log(`[BOT SELECT] tile ${action.tileId} '${selectedTile.ch}': tileTop=${selectedTile.tileTop.toFixed(1)} tileBottom=${(selectedTile.tileTop + selectedTile.tileHeight).toFixed(1)} boardBottom=${boardBottom.toFixed(1)}`);
+        }
+        if (this.botSelectedTileIds.length === 0) {
+          this.firstLetterSelectedAtMs = s.nowMs;
+          this.commitStartedAtMs = s.nowMs; // start commit window
+          this.stallSinceMs = s.nowMs;      // start stall tracking
+          this.stallPattern = "";          // set next tick
+        }
+        this.botSelectedTileIds.push(action.tileId);
+        break;
+
+      case "RELEASE_LAST":
+        this.botSelectedTileIds.pop();
+        if (this.botSelectedTileIds.length === 0) {
+          this.firstLetterSelectedAtMs = 0;
+          this.commitStartedAtMs = 0;
+          this.stallSinceMs = 0;
+          this.stallPattern = "";
+        }
+        this.plan = null;
+        break;
+
+      case "CLEAR_SELECTION":
+        this.botSelectedTileIds = [];
+        this.firstLetterSelectedAtMs = 0;
+        this.commitStartedAtMs = 0;
+        this.stallSinceMs = 0;
+        this.stallPattern = "";
+        this.plan = null;
+        break;
+
+      case "BANK": {
+        const pattern = this.getCurrentPattern(s.tiles);
+
+        // Validate word before banking: must be >= 3 letters AND in dictionary
+        // If validation fails, bot must continue playing (not just clear and give up)
+        if (this.botSelectedTileIds.length < 3) {
+          console.log(`[BOT BANK REJECTED] pattern='${pattern}' - too short (${this.botSelectedTileIds.length} letters, need 3+)`);
+          // Keep selecting tiles to reach 3+ letters
+          break;
+        }
+        if (!this.isValidWord(pattern)) {
+          console.log(`[BOT BANK REJECTED] pattern='${pattern}' - not in dictionary, trying to recover`);
+          // Word not in dictionary - try to undo last letter to find valid word
+          // Or clear if nothing works
+          if (this.botSelectedTileIds.length > 3) {
+            // Try undoing - maybe a shorter version is valid
+            this.botSelectedTileIds.pop();
+            this.plan = null;
+          } else {
+            // At minimum length and still invalid - clear and start fresh
+            this.botSelectedTileIds = [];
+            this.firstLetterSelectedAtMs = 0;
+            this.commitStartedAtMs = 0;
+            this.stallSinceMs = 0;
+            this.stallPattern = "";
+            this.plan = null;
+          }
+          break;
+        }
+
+        // Word is valid - proceed with banking
+        const score = this.estimateBotBankScore(s);
+        this.botScore += score;
+        this.bankedWords.push(pattern.toUpperCase());
+        console.log(`[BOT BANK SUCCESS] word='${pattern}' score=${score} totalScore=${this.botScore}`);
+
+        // streak: match your shared schema intent (>=6 letters build streak)
+        if (this.botSelectedTileIds.length >= 6) {
+          this.botStreak++;
+        } else {
+          this.botStreak = 0;
+        }
+
+        // Only clear selection after successful bank
+        this.botSelectedTileIds = [];
+        this.firstLetterSelectedAtMs = 0;
+        this.commitStartedAtMs = 0;
+        this.stallSinceMs = 0;
+        this.stallPattern = "";
+        this.plan = null;
+        break;
+      }
+    }
+  }
+
+  reset(): void {
+    this.botSelectedTileIds = [];
+    this.botScore = 0;
+    this.botStreak = 0;
+    this.firstLetterSelectedAtMs = 0;
+    this.nextActionAllowedAtMs = 0;
+    this.actionTimestampsMs = [];
+    this.bankedWords = [];
+    this.tileMemory.clear();
+    this.plan = null;
+
+    this.commitStartedAtMs = 0;
+    this.stallSinceMs = 0;
+    this.stallPattern = "";
+  }
+
+  /**
+   * Detailed tick logging for debugging - returns comprehensive decision data
+   */
+  tickWithLog(s: BotTickSnapshot, playerScore: number, playerSelectedTileIds: number[]): BotTickLog {
+    const pattern = this.getCurrentPattern(s.tiles);
+    const isValidWordNow = pattern.length >= 3 && this.isValidWord(pattern);
+    const isPrefixNow = pattern.length > 0 ? this.dict.isPrefixPattern(pattern) : true;
+    const leadsToVocab = pattern.length > 0 ? this.canLeadToVocabWord(pattern) : true;
+    const bankScoreNow = this.botSelectedTileIds.length >= 3 && isValidWordNow ? this.estimateBotBankScore(s) : null;
+    const inCommitWindow = this.isInCommitWindow(s.nowMs);
+    const stallTime = this.stallSinceMs > 0 ? s.nowMs - this.stallSinceMs : 0;
+    
+    // Base log structure
+    const log: BotTickLog = {
+      frameIndex: s.frameIndex,
+      tickMs: s.nowMs,
+      timeRemainingSec: Math.round(s.timeRemainingMs / 100) / 10,
+      botScore: this.botScore,
+      playerScore,
+      botStreak: this.botStreak,
+      currentPattern: pattern || '(empty)',
+      selectedTileCount: this.botSelectedTileIds.length,
+      selectedTileIds: [...this.botSelectedTileIds],
+      planWord: this.plan?.word || null,
+      action: { type: "WAIT" },
+      actionReason: '',
+      reactionDelayMs: this.reactionDelayMs(),
+      nextActionAllowedAtMs: this.nextActionAllowedAtMs,
+      canTakeActionNow: s.nowMs >= this.nextActionAllowedAtMs && this.canTakeAction(s.nowMs),
+      isInCommitWindow: inCommitWindow,
+      stallTimeMs: stallTime,
+      candidateTilesCount: 0,
+      candidateScores: [],
+      bankScore: bankScoreNow,
+      isValidWord: isValidWordNow,
+      isPrefix: isPrefixNow,
+      leadsToVocabWord: leadsToVocab,
+    };
+
+    // Check early exits
+    if (s.roundOver) {
+      log.action = { type: "WAIT" };
+      log.actionReason = 'ROUND_OVER';
+      return log;
+    }
+
+    if (s.nowMs < this.nextActionAllowedAtMs) {
+      log.action = { type: "WAIT" };
+      log.actionReason = `REACTION_COOLDOWN (${Math.round(this.nextActionAllowedAtMs - s.nowMs)}ms remaining)`;
+      return log;
+    }
+
+    if (!this.canTakeAction(s.nowMs)) {
+      log.action = { type: "WAIT" };
+      log.actionReason = 'RATE_LIMITED (max actions/sec reached)';
+      return log;
+    }
+
+    const blockedByPlayer = new Set(playerSelectedTileIds);
+    this.cleanupMissingTiles(s.tiles);
+    this.updateTileMemory(s);
+
+    // Check undo/clear/abandon
+    const fix = this.decideUndoClearOrAbandon(s, playerScore, blockedByPlayer);
+    if (fix) {
+      log.action = fix;
+      if (fix.type === "RELEASE_LAST") {
+        log.actionReason = `UNDO: pattern "${pattern}" - prefix dead or stalled`;
+      } else if (fix.type === "CLEAR_SELECTION") {
+        log.actionReason = `CLEAR: pattern "${pattern}" - prefix dead, stalled, or abandoning`;
+      } else if (fix.type === "BANK") {
+        log.actionReason = `DEFENSIVE_BANK: tiles about to land, banking "${pattern}" for ${bankScoreNow} pts`;
+      }
+      this.recordAction(s.nowMs);
+      this.nextActionAllowedAtMs = s.nowMs + this.reactionDelayMs();
+      this.executeAction(fix, s);
+      return log;
+    }
+
+    // Bank decision
+    if (this.shouldBankNow(s, playerScore)) {
+      log.action = { type: "BANK" };
+      log.actionReason = `BANK: "${pattern}" for ${bankScoreNow} pts (threshold met)`;
+      this.recordAction(s.nowMs);
+      this.nextActionAllowedAtMs = s.nowMs + this.reactionDelayMs();
+      this.executeAction(log.action, s);
+      this.plan = null;
+      return log;
+    }
+
+    // Max length check
+    const maxLen = this.maxWordLength();
+    if (this.botSelectedTileIds.length >= maxLen) {
+      if (this.botSelectedTileIds.length >= 3 && isValidWordNow) {
+        log.action = { type: "BANK" };
+        log.actionReason = `BANK_MAX_LEN: "${pattern}" (hit max word length ${maxLen})`;
+      } else {
+        log.action = { type: "CLEAR_SELECTION" };
+        log.actionReason = `CLEAR_MAX_LEN: hit max ${maxLen} but "${pattern}" not valid`;
+      }
+      this.recordAction(s.nowMs);
+      this.nextActionAllowedAtMs = s.nowMs + this.reactionDelayMs();
+      this.executeAction(log.action, s);
+      this.plan = null;
+      return log;
+    }
+
+    // Plan from board at start
+    if (this.botSelectedTileIds.length === 0) {
+      this.planFromBoardAtStart(s, blockedByPlayer);
+    }
+
+    // Follow plan
+    if (this.plan) {
+      if (s.nowMs - this.plan.createdAtMs > 1600) {
+        this.plan = null;
+      } else {
+        const needed = this.getNextNeededCharFromPlan(pattern);
+        if (needed) {
+          const tileId = this.pickTileForNeededChar(s, blockedByPlayer, needed);
+          if (tileId != null) {
+            const ch = s.tiles.find(t => t.id === tileId)?.ch ?? '';
+            const newPattern = pattern + ch;
+            if (this.canLeadToVocabWord(newPattern)) {
+              log.action = { type: "SELECT_TILE", tileId };
+              log.actionReason = `PLAN_SELECT: picking '${ch}' (tile ${tileId}) for plan word "${this.plan.word}"`;
+              this.recordAction(s.nowMs);
+              this.nextActionAllowedAtMs = s.nowMs + this.reactionDelayMs();
+              this.executeAction(log.action, s);
+              return log;
+            }
+            this.plan = null;
+          }
+        }
+      }
+    }
+
+    // Prefix recognition scoring
+    const nextLetters = this.dict.suggestNextLetters(pattern, 26);
+    const nextSet = new Set(nextLetters);
+
+    const candidates = s.tiles.filter(t =>
+      t.isClickable &&
+      t.blockReason === 'NONE' &&
+      !blockedByPlayer.has(t.id) &&
+      !this.botSelectedTileIds.includes(t.id) &&
+      this.tileIsConsidered(t, s.floorY, s)
+    );
+
+    log.candidateTilesCount = candidates.length;
+
+    if (candidates.length === 0) {
+      log.action = { type: "WAIT" };
+      log.actionReason = 'NO_CANDIDATES: no clickable tiles visible';
+      return log;
+    }
+
+    const iq = stat01(this.stats.intelligence);
+    const v = stat01(this.stats.vocabulary);
+    const risk = stat01(this.stats.riskAppetite);
+
+    const scored: { tileId: number; ch: string; score: number }[] = [];
+
+    for (const tile of candidates) {
+      const matchesDictPrefix = tile.ch === '★' ? true : (nextSet.size === 0 ? true : nextSet.has(tile.ch));
+      if (!matchesDictPrefix) continue;
+
+      const newPattern = pattern + tile.ch;
+      if (!this.canLeadToVocabWord(newPattern)) continue;
+
+      const urgency = 1 - clamp(tile.timeToBottomSec / 5, 0, 1);
+      const multBonus = tile.isWordMultTile ? lerp(0.2, 1.0, iq) : 0;
+      const pointsBonus = clamp(tile.tilePointsShown / 8, 0, 1) * lerp(0.12, 0.35, iq);
+      const starBase = (tile.ch === '★') ? (0.18 + 0.62 * (0.5 * v + 0.5 * risk)) : 0;
+      const conf = this.prefixConfidence(newPattern);
+      const confWeight = lerp(0.05, 0.95, iq);
+
+      let score =
+        1.0 * urgency +
+        0.6 * multBonus +
+        0.35 * pointsBonus +
+        starBase +
+        confWeight * conf;
+
+      score *= 1 + (risk - 0.5) * 0.20;
+      score *= 1 + (this.rand() * 2 - 1) * this.intelligenceNoise();
+
+      scored.push({ tileId: tile.id, ch: tile.ch, score: Math.round(score * 1000) / 1000 });
+    }
+
+    // Sort by score descending and take top 5 for logging
+    scored.sort((a, b) => b.score - a.score);
+    log.candidateScores = scored.slice(0, 5);
+
+    if (scored.length > 0) {
+      const best = scored[0];
+      log.action = { type: "SELECT_TILE", tileId: best.tileId };
+      log.actionReason = `SELECT: '${best.ch}' (tile ${best.tileId}, score ${best.score}) -> "${pattern}${best.ch}"`;
+      this.recordAction(s.nowMs);
+      this.nextActionAllowedAtMs = s.nowMs + this.reactionDelayMs();
+      this.executeAction(log.action, s);
+      return log;
+    }
+
+    // Fallback: if valid word and no good next tiles, consider banking
+    if (this.botSelectedTileIds.length >= 3 && isValidWordNow) {
+      const safeBias = 1 - stat01(this.stats.riskAppetite);
+      if (this.rand() < lerp(0.35, 0.90, safeBias)) {
+        log.action = { type: "BANK" };
+        log.actionReason = `FALLBACK_BANK: no good tiles, banking "${pattern}" for ${bankScoreNow}`;
+        this.recordAction(s.nowMs);
+        this.nextActionAllowedAtMs = s.nowMs + this.reactionDelayMs();
+        this.executeAction(log.action, s);
+        this.plan = null;
+        return log;
+      }
+    }
+
+    log.action = { type: "WAIT" };
+    log.actionReason = 'WAIT: no matching tiles pass prefix/vocab checks';
+    return log;
+  }
+}
